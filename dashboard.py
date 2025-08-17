@@ -340,11 +340,13 @@ skill_merge_map = {
     'go': 'Go', 'golang': 'Go',
     'restful': 'RESTful API', 'restfulapi': 'RESTful API',
     'node': 'Node.js', 'nodejs': 'Node.js',
-    'css': 'CSS', 'css3': 'CSS'
+    'css': 'CSS', 'css3': 'CSS',
+    'c語言': 'C' # 將 'C語言' 統一對應到 'C'
 }
 excluded_skills = {
     'git', 'linux', 'agile', 'ci/cd', 'github', 'gitlab', 'jenkins', 
-    'restful api', 'shell script', 'scrum'
+    'restful api', 'shell script', 'scrum',
+    'c' # 精準排除因關鍵字 'C' 造成的噪聲
 }
 
 def process_skills(skills_list):
