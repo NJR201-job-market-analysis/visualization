@@ -1,0 +1,18 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+streamlit = "*"
+pandas = "*"
+plotly = "*"
+streamlit-aggrid = "*"
+sqlalchemy = "==1.4.54"
+pymysql = "==1.1.1"
+python-dotenv = "*"
+
+[dev-packages]
+
+[requires]
+python_version = "3.8"
