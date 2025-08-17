@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from sqlalchemy import create_engine
+import plotly.graph_objects as go
 from st_aggrid import AgGrid, GridOptionsBuilder
 from dotenv import load_dotenv
 import os
@@ -15,70 +15,52 @@ if 'current_skill' not in st.session_state:
     st.session_state.current_skill = None
 
 
-load_dotenv()
-
-
-# --- 建立資料庫連線 ---
-@st.cache_resource
-def connect_db():
-    user = os.getenv("MYSQL_ACCOUNT")
-    password = os.getenv("MYSQL_PASSWORD")
-    host = os.getenv("MYSQL_HOST")
-    port = os.getenv("MYSQL_PORT")
-    db = os.getenv("MYSQL_DATABASE")
-
-    conn_str = f"mysql+pymysql://{user}:{password}@{host}:{port}/{db}"
-    engine = create_engine(conn_str)
-    return engine
-
-
 # --- 載入資料並預處理 ---
 @st.cache_data
-def load_data(_engine):
-    query = """
-    WITH FirstCategory AS (
-        SELECT
-            jc.job_id,
-            MIN(c.name) AS category_name
-        FROM jobs_categories jc
-        JOIN categories c ON jc.category_id = c.id
-        GROUP BY jc.job_id
-    )
-    SELECT
-        j.*,
-        GROUP_CONCAT(s.name SEPARATOR ',') AS aggregated_skills,
-        fc.category_name
-    FROM
-        jobs AS j
-    LEFT JOIN
-        jobs_skills AS js ON j.id = js.job_id
-    LEFT JOIN
-        skills AS s ON js.skill_id = s.id
-    LEFT JOIN
-        FirstCategory AS fc ON j.id = fc.job_id
-    GROUP BY
-        j.id
-    """
-    with _engine.connect() as connection:
-        df = pd.read_sql(query, connection)
+def load_data():
+    # 從 Parquet 檔案讀取數據，而不是資料庫
+    df = pd.read_parquet("./jobs_data.parquet")
 
     df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
 
-    # 薪資標準化
-    def normalize_salary(row):
-        salary_min = row["salary_min"]
-        salary_type = row["salary_type"]
+    # 薪資標準化 (優化版)
+    def normalize_and_clean_salary(row):
+        salary_min = row['salary_min']
+        salary_max = row['salary_max']
+        salary_type = row['salary_type']
+
         if pd.isna(salary_min):
             return None
-        if salary_type == "年薪":
-            return salary_min / 12
-        elif salary_type == "日薪":
-            return salary_min * 22
-        elif salary_type == "時薪":
-            return salary_min * 176
-        return salary_min
 
-    df["monthly_salary"] = df.apply(normalize_salary, axis=1)
+        # 步驟 1: 如果提供有效的薪資範圍，則使用平均值
+        base_salary = salary_min
+        if pd.notna(salary_max) and salary_max > salary_min:
+            base_salary = (salary_min + salary_max) / 2
+
+        # 步驟 2: 根據薪資類型進行標準化
+        normalized_salary = base_salary
+        if salary_type == "年薪":
+            normalized_salary = base_salary / 12
+        elif salary_type == "日薪":
+            # 對標示錯誤的日薪進行健全性檢查
+            if base_salary > 20000:
+                normalized_salary = base_salary
+            else:
+                normalized_salary = base_salary * 22
+        elif salary_type == "時薪":
+            # 對標示錯誤的時薪進行健全性檢查
+            if base_salary > 2000:
+                normalized_salary = base_salary
+            else:
+                normalized_salary = base_salary * 176
+        
+        # 步驟 3: 對極高的月薪進行最終健全性檢查 (可能為誤標的年薪)
+        if pd.notna(normalized_salary) and normalized_salary > 500000:
+            return normalized_salary / 12
+
+        return normalized_salary
+
+    df["monthly_salary"] = df.apply(normalize_and_clean_salary, axis=1)
     
     # 使用 aggregated_skills 計算技能數量
     df["skills_count"] = (
@@ -93,26 +75,70 @@ def load_data(_engine):
 
 # --- 主程式邏輯 ---
 st.set_page_config(page_title="就業市場 Dashboard", layout="wide")
-st.title("📊 就業市場總覽")
 
-engine = connect_db()
-df = load_data(engine)
+# st.title("📊 就業市場總覽")
+
+df = load_data()
+
+# Fill missing city data with '遠端工作' to prevent them from being filtered out
+df['city'] = df['city'].fillna('遠端工作')
 
 # --- Sidebar Filters ---
 st.sidebar.header("篩選器")
+
+# --- 統一城市名稱 ---
+city_name_map = {
+    '台北市': '臺北市',
+    '台中市': '臺中市',
+    '台南市': '臺南市',
+    '台東縣': '臺東縣',
+    '新竹市': '新竹',
+    '新竹縣': '新竹'
+}
+df['city'] = df['city'].replace(city_name_map)
+
 selected_platform = st.sidebar.multiselect(
     "平台",
     options=df["platform"].unique(),
     default=df["platform"].unique(),
 )
+
+# 定義台灣城市列表，用於過濾篩選器選項
+TAIWAN_CITIES = [
+    '臺北市', '新北市', '桃園市', '臺中市', '臺南市', '高雄市', '基隆市', '新竹', '嘉義市',
+    '苗栗縣', '彰化縣', '南投縣', '雲林縣', '嘉義縣', '屏東縣', '宜蘭縣', '花蓮縣',
+    '臺東縣', '澎湖縣', '金門縣', '連江縣', '遠端工作'
+]
+
+# 從 DataFrame 中取得所有城市，並篩選出台灣的城市
+available_cities = df['city'].dropna().unique()
+taiwan_cities_in_df = sorted([city for city in available_cities if city in TAIWAN_CITIES])
+
 selected_city = st.sidebar.multiselect(
     "城市",
-    options=df["city"].unique(),
-    default=df["city"].unique(),
+    options=taiwan_cities_in_df,
+    default=taiwan_cities_in_df,
 )
-df_filtered = df[
-    df["platform"].isin(selected_platform) & df["city"].isin(selected_city)
+
+# --- Define categories to exclude from all analyses ---
+EXCLUDED_CATEGORIES = [
+    '其他資訊專業人員',
+    'UI/UX設計師',
+    'MIS工程師',
+    'MES工程師',
+    '網路安全分析師',
+    '網路管理工程師'
 ]
+
+df_filtered = df[
+    df["platform"].isin(selected_platform) &
+    df["city"].isin(selected_city) &
+    ~df["category_name"].isin(EXCLUDED_CATEGORIES)
+]
+
+# --- Globally exclude '面議' jobs defaulted to 40k for more accurate analysis ---
+df_filtered = df_filtered[~((df_filtered['salary_type'] == '面議') & (df_filtered['monthly_salary'] == 40000))]
+
 
 # Define a global constant for salary filtering
 MAX_REASONABLE_SALARY = 200000
@@ -131,7 +157,9 @@ col2.metric("🏢 徵才公司數", f"{num_companies:,}")
 # 3. Median Salary
 salary_df_for_median = df_filtered.dropna(subset=['monthly_salary'])
 salary_df_for_median = salary_df_for_median[salary_df_for_median['monthly_salary'] < MAX_REASONABLE_SALARY]
-median_salary = salary_df_for_median['monthly_salary'].median() if not salary_df_for_median.empty else 0
+# 排除薪資為 40000 且類型為「面議」的職缺，以計算更真實的中位數
+adjusted_salary_df = salary_df_for_median[~((salary_df_for_median['salary_type'] == '面議') & (salary_df_for_median['monthly_salary'] == 40000))]
+median_salary = adjusted_salary_df['monthly_salary'].median() if not adjusted_salary_df.empty else 0
 col3.metric("💵 薪資中位數 (月)", f"{median_salary:,.0f} 元")
 
 # 4. Median Experience Requirement
@@ -145,34 +173,40 @@ col4.metric("📈 經驗要求中位數 (年)", f"{median_exp:.1f} 年")
 st.divider()
 
 # --- Market Overview ---
-st.subheader("📊 市場總覽")
 
 c1, c2 = st.columns(2)
 
 with c1:
-    # 1. Job count per platform
-    platform_df = df_filtered["platform"].value_counts().reset_index()
-    platform_df.columns = ["platform", "count"]
-    fig_platform = px.bar(
-        platform_df, 
-        y="count", 
-        x="platform", 
-        title="各平台職缺數量",
-        labels={'platform': '平台', 'count': '職缺數'},
-        text='count'
+    # 1. Job count per platform (Rebuilt with plotly.graph_objects to fix display bug)
+    platform_df = df_filtered.dropna(subset=['platform'])
+    platform_df['platform'] = platform_df['platform'].astype(str)
+    platform_counts = platform_df["platform"].value_counts().reset_index()
+    platform_counts.columns = ["platform", "count"]
+    
+    fig_platform = go.Figure(data=[go.Bar(
+        x=platform_counts['platform'],
+        y=platform_counts['count'],
+        text=platform_counts['count'],
+        textposition='outside',
+        texttemplate='%{text:,.0f}'
+    )])
+    
+    fig_platform.update_layout(
+        title_text='各平台職缺數量',
+        xaxis_title='平台',
+        yaxis_title='職缺數',
+        xaxis={'categoryorder':'total descending'}
     )
-    fig_platform.update_traces(texttemplate='%{text:,.0f}', textposition='outside')
-    fig_platform.update_layout(xaxis={'categoryorder':'total descending'})
     st.plotly_chart(fig_platform, use_container_width=True)
 
 with c2:
-    # 2. Job count per city (top 10)
+    # 2. Job count per city (Top 10)
     city_df = df_filtered["city"].dropna().value_counts().nlargest(10).reset_index()
     city_df.columns = ["city", "count"]
     fig_city = px.bar(
-        city_df, 
-        y="count", 
-        x="city", 
+        city_df,
+        y="count",
+        x="city",
         title="各城市職缺數量 (Top 10)",
         labels={'city': '城市', 'count': '職缺數'},
         text='count'
@@ -184,69 +218,163 @@ with c2:
 c3, c4 = st.columns(2)
 
 with c3:
-    # 3. Job heat (most frequent job categories)
-    category_df = df_filtered['category_name'].dropna().value_counts().nlargest(10).reset_index()
-    category_df.columns = ['category', 'count']
-    fig_category_heat = px.bar(
-        category_df,
-        y='count',
-        x='category',
-        title='職缺熱度 (Top 10 分類)',
-        labels={'category': '職缺分類', 'count': '職缺數'},
-        text='count'
+    # Top Paying Categories
+    cat_counts = df_filtered['category_name'].value_counts()
+    valid_categories = cat_counts[cat_counts >= 5].index
+    high_paying_cat_df = df_filtered[df_filtered['category_name'].isin(valid_categories)].copy()
+    high_paying_cat_df = high_paying_cat_df[high_paying_cat_df['monthly_salary'] < MAX_REASONABLE_SALARY]
+    # Exclude '面議' jobs recorded as 40000 to get a more accurate median salary
+    high_paying_cat_df = high_paying_cat_df[~((high_paying_cat_df['salary_type'] == '面議') & (high_paying_cat_df['monthly_salary'] == 40000))]
+    top_paying_categories = high_paying_cat_df.groupby('category_name')['monthly_salary'].median().nlargest(10).reset_index()
+    top_paying_categories.columns = ['category', 'median_salary']
+    fig_top_cat = px.bar(
+        top_paying_categories.sort_values('median_salary', ascending=True),
+        x='median_salary',
+        y='category',
+        orientation='h',
+        title="Top 10 高薪職缺分類",
+        labels={'category': '職缺分類', 'median_salary': '薪資中位數 (元)'},
+        text='median_salary'
     )
-    fig_category_heat.update_traces(texttemplate='%{text:,.0f}', textposition='outside')
-    fig_category_heat.update_layout(xaxis={'categoryorder':'total descending'}, xaxis_tickangle=-45)
-    st.plotly_chart(fig_category_heat, use_container_width=True)
+    fig_top_cat.update_traces(texttemplate='%{text:,.0f}', textposition='outside')
+    fig_top_cat.update_layout(title_font_size=16, height=450)
+    st.plotly_chart(fig_top_cat, use_container_width=True)
 
 with c4:
-    # 4. Work experience requirement distribution
-    def map_experience(exp):
-        try:
-            if pd.isna(exp):
-                return '無需經驗 / 不拘'
-            exp_num = int(exp)
-            if exp_num <= 0:
-                return '無需經驗 / 不拘'
-            elif exp_num <= 3:
-                return '1-3年'
-            elif exp_num <= 5:
-                return '3-5年'
-            else:
-                return '5年以上'
-        except (ValueError, TypeError):
-            return '無需經驗 / 不拘'
+    # Popular Cities Salary Range Comparison
+    top_cities_for_salary = df_filtered['city'].value_counts().nlargest(5).index
+    city_salary_df = df_filtered[df_filtered['city'].isin(top_cities_for_salary)].copy()
+    city_salary_df = city_salary_df.dropna(subset=['monthly_salary'])
+    city_salary_df = city_salary_df[city_salary_df['monthly_salary'] < MAX_REASONABLE_SALARY]
+    # Exclude '面議' jobs recorded as 40000 to get a more accurate salary range
+    city_salary_df = city_salary_df[~((city_salary_df['salary_type'] == '面議') & (city_salary_df['monthly_salary'] == 40000))]
 
-    exp_df = df_filtered.copy()
-    exp_df['experience_group'] = exp_df['experience_min'].apply(map_experience)
-    exp_dist = exp_df['experience_group'].value_counts().reset_index()
-    exp_dist.columns = ['group', 'count']
+    if not city_salary_df.empty:
+        salary_quantiles = city_salary_df.groupby('city')['monthly_salary'].quantile([0.25, 0.5, 0.75]).unstack().reset_index()
+        salary_quantiles.columns = ['city', '低標 (25%)', '中位數 (50%)', '高標 (75%)']
+        salary_quantiles_melted = salary_quantiles.melt(
+            id_vars='city', 
+            var_name='薪資指標', 
+            value_name='月薪'
+        )
+        fig_city_salary_range = px.bar(
+            salary_quantiles_melted,
+            x='city',
+            y='月薪',
+            color='薪資指標',
+            barmode='group',
+            title='熱門城市薪資範圍比較 (Top 5)',
+            labels={'city': '城市', '月薪': '月薪 (元)'},
+            text='月薪'
+        )
+        fig_city_salary_range.update_traces(texttemplate='%{text:,.0f}', textposition='outside')
+        fig_city_salary_range.update_layout(height=450)
+        st.plotly_chart(fig_city_salary_range, use_container_width=True)
+    else:
+        st.write("無足夠資料可進行城市薪資分析。")
+
+
+# --- 城市職缺分類佔比 (優化版) ---
+top_cities_for_dist = df_filtered['city'].value_counts().nlargest(5).index
+city_category_df_for_dist = df_filtered[df_filtered['city'].isin(top_cities_for_dist)].copy()
+
+# Merge categories for this chart specifically
+city_category_df_for_dist['category_name'] = city_category_df_for_dist['category_name'].replace({'網站開發人員': '前端工程師'})
+city_category_df_for_dist = city_category_df_for_dist[city_category_df_for_dist['category_name'] != '未分類']
     
-    # Define a logical order for the chart
-    order = ['無需經驗 / 不拘', '1-3年', '3-5年', '5年以上']
+# --- Bug Fix: Calculate top categories based on the ENTIRE filtered dataset ---
+# This ensures major roles like '雲端工程師' are not missed
+top_9_categories_overall = df_filtered['category_name'].value_counts().nlargest(9).index
 
-    fig_exp_dist = px.bar(
-        exp_dist,
-        x='group',
-        y='count',
-        title='工作經驗要求分佈',
-        labels={'group': '經驗要求', 'count': '職缺數'},
-        text='count',
-        category_orders={'group': order}
-    )
-    fig_exp_dist.update_traces(texttemplate='%{text:,.0f}', textposition='outside')
-    st.plotly_chart(fig_exp_dist, use_container_width=True)
+# Group less frequent categories into '其他'
+city_category_df_for_dist['display_category'] = city_category_df_for_dist['category_name'].apply(
+    lambda x: x if x in top_9_categories_overall else '其他'
+)
 
+city_category_summary = city_category_df_for_dist.groupby(['city', 'display_category']).size().reset_index(name='count')
+
+# Calculate percentage
+city_sums = city_category_summary.groupby('city')['count'].transform('sum')
+city_category_summary['percentage'] = (100 * city_category_summary['count'] / city_sums).round(1)
+
+fig_city_category = px.bar(
+    city_category_summary,
+    x='city',
+    y='percentage',
+    color='display_category',
+    title='熱門城市職缺分類佔比 (Top 5 城市, Top 9 分類)',
+    labels={'city': '城市', 'percentage': '職缺佔比 (%)', 'display_category': '職缺分類'},
+    barmode='stack'
+)
+st.plotly_chart(fig_city_category, use_container_width=True)
+
+
+# 1. Merge '網站開發人員' into '前端工程師'
+category_dist_df = df_filtered.copy()
+category_dist_df['category_name'] = category_dist_df['category_name'].replace({'網站開發人員': '前端工程師'})
+    
+# 2. Filter out '未分類'
+category_dist_df = category_dist_df[category_dist_df['category_name'] != '未分類']
+    
+# 3. Get top 20 categories
+top_20_dist = category_dist_df['category_name'].value_counts().nlargest(20).reset_index()
+top_20_dist.columns = ['category', 'count']
+
+fig_all_cat_dist = px.bar(
+    top_20_dist.sort_values('count', ascending=True),
+    x='count',
+    y='category',
+    orientation='h',
+    title='全市場職缺分類佔比 (Top 20)',
+    labels={'category': '職缺分類', 'count': '職缺數'},
+    text='count'
+)
+fig_all_cat_dist.update_traces(texttemplate='%{text:,.0f}', textposition='outside')
+fig_all_cat_dist.update_layout(height=600)
+st.plotly_chart(fig_all_cat_dist, use_container_width=True)
+
+
+# --- Skill Processing Definitions ---
+skill_merge_map = {
+    'html5': 'HTML', 'html': 'HTML',
+    'go': 'Go', 'golang': 'Go',
+    'restful': 'RESTful API', 'restfulapi': 'RESTful API',
+    'node': 'Node.js', 'nodejs': 'Node.js',
+    'css': 'CSS', 'css3': 'CSS'
+}
+excluded_skills = {
+    'git', 'linux', 'agile', 'ci/cd', 'github', 'gitlab', 'jenkins', 
+    'restful api', 'shell script', 'scrum'
+}
+
+def process_skills(skills_list):
+    processed_skills = []
+    for s in skills_list:
+        s_stripped = s.strip()
+        s_lower = s_stripped.lower()
+        if s_lower:
+            s_merged = skill_merge_map.get(s_lower, s_stripped)
+            if s_merged.lower() not in excluded_skills:
+                processed_skills.append(s_merged)
+    return processed_skills
+
+
+st.divider()
 
 # --- Skill Analysis ---
-st.divider()
-st.subheader("🧠 技能分析 (依職缺分類)")
+st.subheader("💡 熱門職務技能解析")
 
 # Add a selectbox to filter by category
 top_categories = df_filtered['category_name'].dropna().value_counts().nlargest(10).index.tolist()
+
+# Set '後端工程師' as default if available
+default_category = '後端工程師'
+default_category_index = top_categories.index(default_category) if default_category in top_categories else 0
+
 selected_category = st.selectbox(
     "選擇職缺分類來查看技能需求",
-    options=top_categories
+    options=top_categories,
+    index=default_category_index
 )
 
 if selected_category:
@@ -256,8 +384,9 @@ if selected_category:
     c3, c4 = st.columns(2)
     with c3:
         # --- Popular Skills Treemap ---
-        skills_flat = category_df["required_skills"].dropna().str.cat(sep=",").split(",")
-        skill_counts = Counter([s.strip() for s in skills_flat if s.strip()])
+        skills_flat_raw = category_df["required_skills"].dropna().str.cat(sep=",").split(",")
+        skills_flat = process_skills(skills_flat_raw)
+        skill_counts = Counter(skills_flat)
         skill_df = pd.DataFrame(skill_counts.items(), columns=["skill", "count"]).sort_values(
             by="count", ascending=False
         ).nlargest(15, 'count')
@@ -285,7 +414,8 @@ if selected_category:
         skills_list = []
         if not skills_salary_df.empty:
             for index, row in skills_salary_df.iterrows():
-                skills = [s.strip() for s in row['required_skills'].split(',')]
+                skills_raw = row['required_skills'].split(',')
+                skills = process_skills(skills_raw)
                 for skill in skills:
                     skills_list.append({'skill': skill, 'monthly_salary': row['monthly_salary']})
         
@@ -316,16 +446,25 @@ if selected_category:
         else:
             st.write(f"在 <b>{selected_category}</b> 分類中無足夠薪資資料可分析。", unsafe_allow_html=True)
 
+
+st.divider()
 # --- Skill Reverse Lookup ---
-st.subheader("🔍 探索技能的職務應用 (依技能反查)")
+st.subheader("💡 技能與就業機會解析")
 # Create a list of top skills for the selectbox
-all_skills_flat = df_filtered["required_skills"].dropna().str.cat(sep=",").split(",")
-all_skill_counts = Counter([s.strip() for s in all_skills_flat if s.strip()])
+all_skills_flat_raw = df_filtered["required_skills"].dropna().str.cat(sep=",").split(",")
+all_skills_flat = process_skills(all_skills_flat_raw)
+all_skill_counts = Counter(all_skills_flat)
 top_50_skills = [skill for skill, count in all_skill_counts.most_common(50)]
+
+# Set 'Java' as default if available
+skill_options = sorted(top_50_skills)
+default_skill = 'Java'
+default_skill_index = skill_options.index(default_skill) if default_skill in skill_options else 0
 
 selected_skill_lookup = st.selectbox(
     "選擇一個技能來查詢相關職缺分類與範例",
-    options=sorted(top_50_skills)
+    options=skill_options,
+    index=default_skill_index
 )
 
 if selected_skill_lookup:
@@ -342,7 +481,6 @@ if selected_skill_lookup:
         s_col1, s_col2 = st.columns([1, 1])
 
         with s_col1:
-            st.markdown(f"##### '{selected_skill_lookup}' 主要應用於以下職類")
             category_counts = skill_lookup_df['category_name'].dropna().value_counts().nlargest(10).reset_index()
             category_counts.columns = ['category', 'count']
             
@@ -441,23 +579,32 @@ if selected_skill_lookup:
 
 
 st.divider()
-st.subheader("🏙️ 分類與城市分析")
+st.subheader("城市薪資分析")
 
 # --- 城市與分類薪資比較 ---
-# Find top 10 most common categories to populate the filter
-top_10_common_categories = df_filtered['category_name'].dropna().value_counts().nlargest(10).index.tolist()
+# Find all categories with a reasonable number of jobs (e.g., >= 5) to provide a complete list
+all_cat_counts = df_filtered['category_name'].dropna().value_counts()
+available_categories_for_comparison = all_cat_counts[all_cat_counts >= 5].index.tolist()
+
 
 # Add filters for city and category
 selected_cities_for_comparison = st.multiselect(
     "選擇要比較的城市",
     options=sorted([city for city in df_filtered['city'].unique() if pd.notna(city)]),
-    default=df_filtered['city'].value_counts().nlargest(2).index.tolist() # Default to top 2 cities
+    default=['臺北市', '高雄市']
 )
+
+# Set default categories for comparison, ensuring they exist in the options
+default_categories_to_select = ['前端工程師', '後端工程師', '雲端工程師', '資料工程師']
+default_categories = [cat for cat in default_categories_to_select if cat in available_categories_for_comparison]
+# If none of the preferred defaults are available, fall back to the top one from the available list
+if not default_categories and available_categories_for_comparison:
+    default_categories = available_categories_for_comparison[:1]
 
 selected_categories_for_comparison = st.multiselect(
     "選擇要比較的職缺分類",
-    options=top_10_common_categories,
-    default=top_10_common_categories[:3] # Default to top 3 most common categories
+    options=available_categories_for_comparison,
+    default=default_categories
 )
 
 if selected_cities_for_comparison and selected_categories_for_comparison:
@@ -471,17 +618,17 @@ if selected_cities_for_comparison and selected_categories_for_comparison:
     comparison_df = comparison_df.dropna(subset=['monthly_salary'])
 
     if not comparison_df.empty:
-        # Calculate average salary
-        comparison_avg_salary = comparison_df.groupby(['city', 'category_name'])['monthly_salary'].mean().round(0).reset_index()
+        # 改為計算薪資中位數，以提供更穩健、更具代表性的比較
+        comparison_median_salary = comparison_df.groupby(['city', 'category_name'])['monthly_salary'].median().round(0).reset_index()
 
         fig_comparison = px.bar(
-            comparison_avg_salary,
+            comparison_median_salary,
             x='category_name',
             y='monthly_salary',
             color='city',
             barmode='group',
-            title='城市與分類薪資比較',
-            labels={'category_name': '職缺分類', 'monthly_salary': '平均月薪', 'city': '城市'},
+            # title='城市與分類薪資比較',
+            labels={'category_name': '職缺分類', 'monthly_salary': '薪資中位數 (元)', 'city': '城市'},
             text='monthly_salary'
         )
         fig_comparison.update_traces(texttemplate='%{text:,.0f}', textposition='outside')
@@ -491,132 +638,3 @@ if selected_cities_for_comparison and selected_categories_for_comparison:
         st.write("無足夠資料可進行比較分析。")
 else:
     st.write("請至少選擇一個城市和一個職缺分類進行比較。")
-
-
-# --- 城市職缺分類 ---
-top_cities = df_filtered['city'].value_counts().nlargest(5).index
-city_category_df = df_filtered[df_filtered['city'].isin(top_cities)]
-city_category_summary = city_category_df.groupby(['city', 'category_name']).size().reset_index(name='count')
-
-# Calculate percentage
-city_sums = city_category_summary.groupby('city')['count'].transform('sum')
-city_category_summary['percentage'] = 100 * city_category_summary['count'] / city_sums
-
-fig_city_category = px.bar(
-    city_category_summary,
-    x='city',
-    y='percentage',
-    color='category_name',
-    title='熱門城市職缺分類佔比',
-    labels={'city': '城市', 'percentage': '職缺佔比 (%)', 'category_name': '職缺分類'},
-    barmode='stack'
-)
-st.plotly_chart(fig_city_category, use_container_width=True)
-
-# --- 城市薪資範圍比較 ---
-st.markdown("##### 🏙️ 熱門城市薪資範圍比較")
-city_salary_df = df_filtered[df_filtered['city'].isin(top_cities)].copy()
-city_salary_df = city_salary_df.dropna(subset=['monthly_salary'])
-city_salary_df = city_salary_df[city_salary_df['monthly_salary'] < MAX_REASONABLE_SALARY]
-
-if not city_salary_df.empty:
-    # Calculate quantiles
-    salary_quantiles = city_salary_df.groupby('city')['monthly_salary'].quantile([0.25, 0.5, 0.75]).unstack().reset_index()
-    salary_quantiles.columns = ['city', '低標 (25%)', '中位數 (50%)', '高標 (75%)']
-    
-    # Melt the dataframe for plotting
-    salary_quantiles_melted = salary_quantiles.melt(
-        id_vars='city', 
-        var_name='薪資指標', 
-        value_name='月薪'
-    )
-
-    fig_city_salary_range = px.bar(
-        salary_quantiles_melted,
-        x='city',
-        y='月薪',
-        color='薪資指標',
-        barmode='group',
-        title='熱門城市薪資範圍比較',
-        labels={'city': '城市', '月薪': '月薪 (元)'},
-        text='月薪'
-    )
-    fig_city_salary_range.update_traces(texttemplate='%{text:,.0f}', textposition='outside')
-    st.plotly_chart(fig_city_salary_range, use_container_width=True)
-else:
-    st.write("無足夠資料可進行城市薪資分析。")
-
-
-st.divider()
-st.subheader("📊 市場排行榜")
-
-# --- First Row of Leaderboards ---
-insight_col1, insight_col2 = st.columns(2)
-
-with insight_col1:
-    # 1. Top Hirers
-    st.markdown("##### 🏢 主要招聘公司")
-    top_hirers = df_filtered['company_name'].dropna().value_counts().nlargest(10).reset_index()
-    top_hirers.columns = ['company', 'count']
-    fig_hirers = px.bar(
-        top_hirers,
-        x='count',
-        y='company',
-        orientation='h',
-        title="Top 10 招聘公司",
-        labels={'company': '公司', 'count': '職缺數'}
-    )
-    fig_hirers.update_layout(yaxis={'categoryorder':'total ascending'}, title_font_size=16, height=400)
-    st.plotly_chart(fig_hirers, use_container_width=True)
-
-with insight_col2:
-    # 2. Top Paying Categories
-    st.markdown("##### 💵 高薪職缺分類排行")
-    # Filter for categories with at least 5 job postings
-    cat_counts = df_filtered['category_name'].value_counts()
-    valid_categories = cat_counts[cat_counts >= 5].index
-    
-    high_paying_cat_df = df_filtered[df_filtered['category_name'].isin(valid_categories)].copy()
-    high_paying_cat_df = high_paying_cat_df[high_paying_cat_df['monthly_salary'] < MAX_REASONABLE_SALARY]
-    
-    top_paying_categories = high_paying_cat_df.groupby('category_name')['monthly_salary'].median().nlargest(10).reset_index()
-    top_paying_categories.columns = ['category', 'median_salary']
-
-    fig_top_cat = px.bar(
-        top_paying_categories.sort_values('median_salary', ascending=True),
-        x='median_salary',
-        y='category',
-        orientation='h',
-        title="Top 10 高薪職缺分類",
-        labels={'category': '職缺分類', 'median_salary': '薪資中位數 (元)'},
-        text='median_salary'
-    )
-    fig_top_cat.update_traces(texttemplate='%{text:,.0f}', textposition='outside')
-    fig_top_cat.update_layout(title_font_size=16, height=400)
-    st.plotly_chart(fig_top_cat, use_container_width=True)
-
-# --- Second Row for the last chart ---
-# 3. Top Paying Companies
-st.markdown("##### 💰 高薪公司排行")
-# Filter for companies with at least 5 job postings
-comp_counts = df_filtered['company_name'].value_counts()
-valid_companies = comp_counts[comp_counts >= 5].index
-
-high_paying_comp_df = df_filtered[df_filtered['company_name'].isin(valid_companies)].copy()
-high_paying_comp_df = high_paying_comp_df[high_paying_comp_df['monthly_salary'] < MAX_REASONABLE_SALARY]
-
-top_paying_companies = high_paying_comp_df.groupby('company_name')['monthly_salary'].median().nlargest(10).reset_index()
-top_paying_companies.columns = ['company', 'median_salary']
-
-fig_top_comp = px.bar(
-    top_paying_companies.sort_values('median_salary', ascending=True),
-    x='median_salary',
-    y='company',
-    orientation='h',
-    title="Top 10 高薪公司",
-    labels={'company': '公司', 'median_salary': '薪資中位數 (元)'},
-    text='median_salary'
-)
-fig_top_comp.update_traces(texttemplate='%{text:,.0f}', textposition='outside')
-fig_top_comp.update_layout(title_font_size=16, height=400)
-st.plotly_chart(fig_top_comp, use_container_width=True)
