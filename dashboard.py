@@ -365,15 +365,17 @@ st.divider()
 st.subheader("💡 熱門職務技能解析")
 
 # Add a selectbox to filter by category
-top_categories = df_filtered['category_name'].dropna().value_counts().nlargest(10).index.tolist()
+# Get all categories with a reasonable number of jobs (>= 5) to provide a complete list
+all_cat_counts_for_skills = df_filtered['category_name'].dropna().value_counts()
+available_categories_for_skills = all_cat_counts_for_skills[all_cat_counts_for_skills >= 5].index.tolist()
 
 # Set '後端工程師' as default if available
 default_category = '後端工程師'
-default_category_index = top_categories.index(default_category) if default_category in top_categories else 0
+default_category_index = available_categories_for_skills.index(default_category) if default_category in available_categories_for_skills else 0
 
 selected_category = st.selectbox(
     "選擇職缺分類來查看技能需求",
-    options=top_categories,
+    options=available_categories_for_skills,
     index=default_category_index
 )
 
@@ -423,6 +425,9 @@ if selected_category:
             skills_exploded_df = pd.DataFrame(skills_list)
             skill_analysis = skills_exploded_df.groupby('skill')['monthly_salary'].agg(['mean', 'count']).reset_index()
             skill_analysis = skill_analysis.rename(columns={'mean': 'avg_salary'})
+
+            # 將平均薪資四捨五入至整數，以利閱讀
+            skill_analysis['avg_salary'] = skill_analysis['avg_salary'].round(0).astype(int)
 
             # Get top skills from the treemap data to ensure consistency
             top_skills_in_category = skill_df['skill'].tolist()
