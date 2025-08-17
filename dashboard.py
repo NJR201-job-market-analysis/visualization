@@ -18,8 +18,8 @@ if 'current_skill' not in st.session_state:
 # --- 載入資料並預處理 ---
 @st.cache_data
 def load_data():
-    # 從 Parquet 檔案讀取數據，而不是資料庫
-    df = pd.read_parquet("./jobs_data.parquet")
+    # 從 Parquet 檔案讀取數據，確保路徑為相對於專案根目錄
+    df = pd.read_parquet("jobs_data.parquet")
 
     df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
 
